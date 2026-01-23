@@ -7,184 +7,28 @@ import {
   beforeAll,
   beforeEach,
   afterEach,
-  Mock,
 } from 'vitest';
 import * as React from 'react';
 import { render, screen, waitFor, act } from '@testing-library/react';
-import { Client, fetchExchange, gql } from '@urql/core';
-import { cacheExchange } from '@urql/exchange-graphcache';
+import { gql } from '@urql/core';
 
 import { Provider } from '../context';
 import { useQuery } from './useQuery';
+import {
+  createFetchMockController,
+  createTestClient,
+  setupSuspenseTestEnvironment,
+  assertSuspenseInvariant,
+  FetchMockController,
+} from './suspense-test-utils';
 
-const fetch = (globalThis as any).fetch as Mock;
 const abort = vi.fn();
-
-interface FetchMockRequest {
-  url: string;
-  body: {
-    query?: string;
-    variables?: Record<string, unknown>;
-    operationName?: string;
-  } | null;
-  resolve: (response: MockResponse) => void;
-  resolved?: boolean;
-}
-
-interface MockResponse {
-  data?: unknown;
-  errors?: Array<{ message: string; path?: string[] }>;
-  hasNext?: boolean;
-}
-
-interface FetchMockController {
-  requests: FetchMockRequest[];
-  respond: (
-    data: unknown,
-    options?: {
-      errors?: Array<{ message: string; path?: string[] }>;
-      hasNext?: boolean;
-    }
-  ) => void;
-  respondToLatest: (
-    data: unknown,
-    options?: {
-      errors?: Array<{ message: string; path?: string[] }>;
-      hasNext?: boolean;
-    }
-  ) => void;
-  reset: () => void;
-}
-
-const createFetchMockController = (): FetchMockController => {
-  const requests: FetchMockRequest[] = [];
-
-  fetch.mockImplementation((url: string, options?: RequestInit) => {
-    return new Promise<Response>(resolve => {
-      let body: FetchMockRequest['body'] = null;
-
-      // First try to get body from POST request body
-      if (options && options.body) {
-        if (typeof options.body === 'string') {
-          try {
-            body = JSON.parse(options.body);
-          } catch {
-            body = { query: options.body };
-          }
-        } else if (options.body instanceof FormData) {
-          const operations = options.body.get('operations');
-          if (operations && typeof operations === 'string') {
-            try {
-              body = JSON.parse(operations);
-            } catch {
-              // ignore
-            }
-          }
-        }
-      }
-
-      // For GET requests, extract query/variables from URL
-      if (!body && url.includes('?')) {
-        const urlObj = new URL(url);
-        const query = urlObj.searchParams.get('query');
-        const variables = urlObj.searchParams.get('variables');
-        const operationName = urlObj.searchParams.get('operationName');
-        if (query || variables) {
-          body = {
-            query: query ?? undefined,
-            variables: variables ? JSON.parse(variables) : undefined,
-            operationName: operationName ?? undefined,
-          };
-        }
-      }
-
-      const request: FetchMockRequest = {
-        url,
-        body,
-        resolve: (mockResponse: MockResponse) => {
-          const responseBody = JSON.stringify({
-            data: mockResponse.data,
-            errors: mockResponse.errors,
-            hasNext: mockResponse.hasNext,
-          });
-          resolve({
-            status: 200,
-            headers: { get: () => 'application/json' },
-            text: vi.fn().mockResolvedValue(responseBody),
-          } as unknown as Response);
-        },
-      };
-
-      requests.push(request);
-    });
-  });
-
-  return {
-    requests,
-    respond(data, options = {}) {
-      const request = requests.find(r => !r.resolved);
-      if (!request) throw new Error('No pending fetch request');
-      request.resolve({
-        data,
-        errors: options.errors,
-        hasNext: options.hasNext,
-      });
-      request.resolved = true;
-    },
-    respondToLatest(data, options = {}) {
-      const request = requests[requests.length - 1];
-      if (!request) throw new Error('No pending fetch request');
-      if (request.resolved) throw new Error('Request already resolved');
-      request.resolve({
-        data,
-        errors: options.errors,
-        hasNext: options.hasNext,
-      });
-      request.resolved = true;
-    },
-    reset() {
-      requests.length = 0;
-      fetch.mockClear();
-    },
-  };
-};
-
-const createTestClient = (cacheOpts?: Parameters<typeof cacheExchange>[0]) => {
-  return new Client({
-    url: 'http://test/graphql',
-    suspense: true,
-    exchanges: [cacheExchange(cacheOpts), fetchExchange],
-  });
-};
-
-const assertValidSuspenseResult = (
-  result: { data?: unknown; error?: unknown; fetching: boolean },
-  pause?: boolean
-) => {
-  if (pause) return;
-  const hasData = result.data !== undefined && result.data !== null;
-  const hasError = result.error !== undefined;
-  if (!hasData && !hasError) {
-    throw new Error(
-      `Suspense invariant violation: component rendered without data or error. ` +
-        `This should never happen - suspense should keep the component suspended. ` +
-        `Result: ${JSON.stringify({ data: result.data, error: result.error, fetching: result.fetching })}`
-    );
-  }
-};
 
 describe('useQuery suspense with graphcache', () => {
   let fetchMock: FetchMockController;
 
   beforeAll(() => {
-    (globalThis as any).AbortController = function AbortController() {
-      this.signal = undefined;
-      this.abort = abort;
-    };
-
-    vi.spyOn(globalThis.console, 'error').mockImplementation(() => {
-      // suppress React error boundary warnings in tests
-    });
+    setupSuspenseTestEnvironment(abort);
   });
 
   beforeEach(() => {
@@ -198,7 +42,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('cache miss scenarios', () => {
     it('should suspend until network response arrives', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -212,7 +56,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
@@ -251,7 +95,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should handle network errors and unsuspend', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -265,7 +109,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         if (result.error) {
           return <div data-testid="error">{result.error.message}</div>;
         }
@@ -305,7 +149,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('cache hit scenarios', () => {
     it('should not suspend when data is fully cached', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -319,7 +163,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const PopulateComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="populate">
             {result.data?.author?.name ?? 'loading'}
@@ -362,7 +206,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
@@ -381,7 +225,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should suspend for partial cache hits when requesting additional fields', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const basicQuery = gql`
         query BasicQuery {
@@ -406,7 +250,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const PopulateComponent = () => {
         const [result] = useQuery({ query: basicQuery });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="populate">
             {result.data?.author?.name ?? 'loading'}
@@ -447,7 +291,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const ExtendedComponent = () => {
         const [result] = useQuery({ query: extendedQuery });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="extended">
             {result.data?.author?.email ?? 'no email'}
@@ -491,7 +335,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('cache-and-network policy', () => {
     it('should return stale cached data without suspending then update', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -505,7 +349,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const PopulateComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="populate">
             {result.data?.author?.name ?? 'loading'}
@@ -552,7 +396,7 @@ describe('useQuery suspense with graphcache', () => {
           query,
           requestPolicy: 'cache-and-network',
         });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div>
             <div data-testid="data">
@@ -600,7 +444,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('hasNext/streaming queries', () => {
     it('should unsuspend when first chunk with data arrives (hasNext: true)', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -614,7 +458,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         const authorName = result.data?.author?.name ?? 'no author';
         return (
           <div>
@@ -665,7 +509,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should show complete when response has hasNext: false', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -679,7 +523,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         const authorName = result.data?.author?.name ?? 'no author';
         return (
           <div>
@@ -729,7 +573,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('multiple concurrent queries', () => {
     it('should handle two different queries suspending and resolving independently', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const authorQuery = gql`
         query AuthorQuery {
@@ -753,7 +597,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const AuthorComponent = () => {
         const [result] = useQuery({ query: authorQuery });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="author">
             {result.data?.author?.name ?? 'no author'}
@@ -763,7 +607,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const PostsComponent = () => {
         const [result] = useQuery({ query: postsQuery });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="posts">{result.data?.posts?.length ?? 0} posts</div>
         );
@@ -794,7 +638,6 @@ describe('useQuery suspense with graphcache', () => {
         expect(fetchMock.requests.length).toBe(2);
       });
 
-      // Find and respond to author query
       const authorReqIndex = fetchMock.requests.findIndex(
         r => r.body?.operationName === 'AuthorQuery'
       );
@@ -822,7 +665,6 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.getByTestId('posts-fallback')).toBeDefined();
       });
 
-      // Find and respond to posts query
       const postsReqIndex = fetchMock.requests.findIndex(
         r => r.body?.operationName === 'PostsQuery'
       );
@@ -851,7 +693,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('error handling', () => {
     it('should handle GraphQL errors with partial data', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -869,7 +711,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = () => {
         const [result] = useQuery({ query });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div>
             <div data-testid="author">
@@ -930,7 +772,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('variable changes', () => {
     it('should suspend when variables change to uncached values', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery($id: ID!) {
@@ -944,7 +786,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = ({ authorId }: { authorId: string }) => {
         const [result] = useQuery({ query, variables: { id: authorId } });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
@@ -1012,7 +854,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should not suspend when variables change to cached values', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery($id: ID!) {
@@ -1026,7 +868,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = ({ authorId }: { authorId: string }) => {
         const [result] = useQuery({ query, variables: { id: authorId } });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
@@ -1103,7 +945,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('pause behavior', () => {
     it('should not suspend when initially paused', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -1144,7 +986,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should start suspending when unpaused', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -1159,7 +1001,7 @@ describe('useQuery suspense with graphcache', () => {
       const TestComponent = ({ pause }: { pause: boolean }) => {
         const [result] = useQuery({ query, pause });
         if (!pause) {
-          assertValidSuspenseResult(result, pause);
+          assertSuspenseInvariant(result, pause);
         }
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
@@ -1212,7 +1054,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should stop suspending when paused while suspended', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -1266,7 +1108,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should keep data when paused after receiving data', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -1281,7 +1123,7 @@ describe('useQuery suspense with graphcache', () => {
       const TestComponent = ({ pause }: { pause: boolean }) => {
         const [result] = useQuery({ query, pause });
         if (!pause) {
-          assertValidSuspenseResult(result, pause);
+          assertSuspenseInvariant(result, pause);
         }
         return (
           <div data-testid="data">
@@ -1343,7 +1185,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should handle multiple pause/unpause cycles', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery {
@@ -1451,7 +1293,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should use new variables when unpaused after variable change', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query TestQuery($id: ID!) {
@@ -1466,7 +1308,7 @@ describe('useQuery suspense with graphcache', () => {
       const TestComponent = ({ pause, id }: { pause: boolean; id: string }) => {
         const [result] = useQuery({ query, variables: { id }, pause });
         if (!pause) {
-          assertValidSuspenseResult(result, pause);
+          assertSuspenseInvariant(result, pause);
         }
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'none'}</div>
@@ -1531,7 +1373,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should not suspend when paused even with graphcache partial result', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const basicQuery = gql`
         query BasicQuery {
@@ -1556,7 +1398,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const PopulateComponent = () => {
         const [result] = useQuery({ query: basicQuery });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="populate">
             {result.data?.author?.name ?? 'loading'}
@@ -1622,7 +1464,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should create new subscription when executeQuery called after pause/unpause cycle', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
       let executeQuery: ReturnType<typeof useQuery>[1];
 
       const query = gql`
@@ -1639,7 +1481,7 @@ describe('useQuery suspense with graphcache', () => {
         const [result, execute] = useQuery({ query, pause });
         executeQuery = execute;
         if (!pause) {
-          assertValidSuspenseResult(result, pause);
+          assertSuspenseInvariant(result, pause);
         }
         return (
           <div data-testid="data">
@@ -1665,7 +1507,6 @@ describe('useQuery suspense with graphcache', () => {
 
       expect(fetchMock.requests.length).toBe(1);
 
-      // Respond to first request
       await act(async () => {
         fetchMock.respondToLatest({
           __typename: 'Query',
@@ -1684,7 +1525,6 @@ describe('useQuery suspense with graphcache', () => {
         );
       });
 
-      // Pause the query
       rerender(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -1699,7 +1539,6 @@ describe('useQuery suspense with graphcache', () => {
 
       const opsBeforeRefetch = fetchMock.requests.length;
 
-      // Unpause the query
       rerender(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -1708,7 +1547,6 @@ describe('useQuery suspense with graphcache', () => {
         </Provider>
       );
 
-      // Explicitly trigger refetch with network-only policy
       act(() => {
         executeQuery({ requestPolicy: 'network-only' });
       });
@@ -1738,7 +1576,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('suspense invariant edge cases', () => {
     it('should not return cached result without data in suspense mode', async () => {
-      const client = createTestClient();
+      const client = createTestClient({ useGraphcache: true });
 
       const query = gql`
         query GetAuthor($id: ID!) {
@@ -1754,7 +1592,7 @@ describe('useQuery suspense with graphcache', () => {
           query,
           variables: { id: '1' },
         });
-        assertValidSuspenseResult(result);
+        assertSuspenseInvariant(result);
         return (
           <div data-testid="data">
             {result.data?.author?.name ?? 'no data'} (fetching:{' '}
