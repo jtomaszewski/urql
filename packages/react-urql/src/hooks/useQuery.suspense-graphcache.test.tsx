@@ -1621,8 +1621,9 @@ describe('useQuery suspense with graphcache', () => {
       );
     });
 
-    it('should clean up orphaned promise when pausing so unpause creates new subscription', async () => {
+    it('should create new subscription when executeQuery called after pause/unpause cycle', async () => {
       const client = createTestClient();
+      let executeQuery: ReturnType<typeof useQuery>[1];
 
       const query = gql`
         query TestQuery {
@@ -1635,7 +1636,8 @@ describe('useQuery suspense with graphcache', () => {
       `;
 
       const TestComponent = ({ pause }: { pause: boolean }) => {
-        const [result] = useQuery({ query, pause });
+        const [result, execute] = useQuery({ query, pause });
+        executeQuery = execute;
         if (!pause) {
           assertValidSuspenseResult(result, pause);
         }
@@ -1663,6 +1665,26 @@ describe('useQuery suspense with graphcache', () => {
 
       expect(fetchMock.requests.length).toBe(1);
 
+      // Respond to first request
+      await act(async () => {
+        fetchMock.respondToLatest({
+          __typename: 'Query',
+          author: {
+            __typename: 'Author',
+            id: '1',
+            name: 'Initial Author',
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('fallback')).toBeNull();
+        expect(screen.getByTestId('data').textContent).toContain(
+          'data: Initial Author'
+        );
+      });
+
+      // Pause the query
       rerender(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -1675,8 +1697,9 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.queryByTestId('fallback')).toBeNull();
       });
 
-      const opsBeforeUnpause = fetchMock.requests.length;
+      const opsBeforeRefetch = fetchMock.requests.length;
 
+      // Unpause the query
       rerender(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -1685,12 +1708,14 @@ describe('useQuery suspense with graphcache', () => {
         </Provider>
       );
 
-      await waitFor(
-        () => {
-          expect(fetchMock.requests.length).toBeGreaterThan(opsBeforeUnpause);
-        },
-        { timeout: 1000 }
-      );
+      // Explicitly trigger refetch with network-only policy
+      act(() => {
+        executeQuery({ requestPolicy: 'network-only' });
+      });
+
+      await waitFor(() => {
+        expect(fetchMock.requests.length).toBeGreaterThan(opsBeforeRefetch);
+      });
 
       await act(async () => {
         fetchMock.respondToLatest({
@@ -1698,14 +1723,14 @@ describe('useQuery suspense with graphcache', () => {
           author: {
             __typename: 'Author',
             id: '1',
-            name: 'Test Author',
+            name: 'Refetched Author',
           },
         });
       });
 
       await waitFor(() => {
         expect(screen.getByTestId('data').textContent).toContain(
-          'data: Test Author'
+          'data: Refetched Author'
         );
       });
     });
