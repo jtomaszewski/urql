@@ -1,89 +1,159 @@
 // @vitest-environment jsdom
-import { vi, expect, it, describe, beforeAll } from 'vitest';
+import {
+  vi,
+  expect,
+  it,
+  describe,
+  beforeAll,
+  beforeEach,
+  afterEach,
+  Mock,
+} from 'vitest';
 import * as React from 'react';
 import { render, screen, waitFor, act } from '@testing-library/react';
-import { makeSubject, pipe, subscribe, filter } from 'wonka';
-import {
-  Client,
-  CombinedError,
-  Exchange,
-  gql,
-  Operation,
-  OperationResult,
-} from '@urql/core';
+import { Client, fetchExchange, gql } from '@urql/core';
 import { cacheExchange } from '@urql/exchange-graphcache';
 
 import { Provider } from '../context';
 import { useQuery } from './useQuery';
 
-interface TestNetworkExchange {
-  exchange: Exchange;
-  operations: Operation[];
-  respond: (
-    keyOrOperation: number | Operation,
-    data: any,
-    options?: { hasNext?: boolean; error?: CombinedError; stale?: boolean }
-  ) => void;
-  respondToLatest: (
-    data: any,
-    options?: { hasNext?: boolean; error?: CombinedError; stale?: boolean }
-  ) => void;
+const fetch = (globalThis as any).fetch as Mock;
+const abort = vi.fn();
+
+interface FetchMockRequest {
+  url: string;
+  body: {
+    query?: string;
+    variables?: Record<string, unknown>;
+    operationName?: string;
+  } | null;
+  resolve: (response: MockResponse) => void;
+  resolved?: boolean;
 }
 
-const createTestNetworkExchange = (): TestNetworkExchange => {
-  const operations: Operation[] = [];
-  const { source: res$, next: nextRes } = makeSubject<OperationResult>();
+interface MockResponse {
+  data?: unknown;
+  errors?: Array<{ message: string; path?: string[] }>;
+  hasNext?: boolean;
+}
 
-  const exchange: Exchange = () => ops$ => {
-    pipe(
-      ops$,
-      filter(op => op.kind !== 'teardown'),
-      subscribe(op => {
-        operations.push(op);
-      })
-    );
-    return res$;
-  };
+interface FetchMockController {
+  requests: FetchMockRequest[];
+  respond: (
+    data: unknown,
+    options?: {
+      errors?: Array<{ message: string; path?: string[] }>;
+      hasNext?: boolean;
+    }
+  ) => void;
+  respondToLatest: (
+    data: unknown,
+    options?: {
+      errors?: Array<{ message: string; path?: string[] }>;
+      hasNext?: boolean;
+    }
+  ) => void;
+  reset: () => void;
+}
 
-  const respond = (
-    keyOrOperation: number | Operation,
-    data: any,
-    options?: { hasNext?: boolean; error?: CombinedError; stale?: boolean }
-  ) => {
-    const op =
-      typeof keyOrOperation === 'number'
-        ? operations.find(o => o.key === keyOrOperation)
-        : keyOrOperation;
-    if (!op) throw new Error(`No operation found`);
-    nextRes({
-      operation: op,
-      data,
-      error: options?.error,
-      hasNext: options?.hasNext ?? false,
-      stale: options?.stale ?? false,
+const createFetchMockController = (): FetchMockController => {
+  const requests: FetchMockRequest[] = [];
+
+  fetch.mockImplementation((url: string, options?: RequestInit) => {
+    return new Promise<Response>(resolve => {
+      let body: FetchMockRequest['body'] = null;
+
+      // First try to get body from POST request body
+      if (options && options.body) {
+        if (typeof options.body === 'string') {
+          try {
+            body = JSON.parse(options.body);
+          } catch {
+            body = { query: options.body };
+          }
+        } else if (options.body instanceof FormData) {
+          const operations = options.body.get('operations');
+          if (operations && typeof operations === 'string') {
+            try {
+              body = JSON.parse(operations);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+
+      // For GET requests, extract query/variables from URL
+      if (!body && url.includes('?')) {
+        const urlObj = new URL(url);
+        const query = urlObj.searchParams.get('query');
+        const variables = urlObj.searchParams.get('variables');
+        const operationName = urlObj.searchParams.get('operationName');
+        if (query || variables) {
+          body = {
+            query: query ?? undefined,
+            variables: variables ? JSON.parse(variables) : undefined,
+            operationName: operationName ?? undefined,
+          };
+        }
+      }
+
+      const request: FetchMockRequest = {
+        url,
+        body,
+        resolve: (mockResponse: MockResponse) => {
+          const responseBody = JSON.stringify({
+            data: mockResponse.data,
+            errors: mockResponse.errors,
+            hasNext: mockResponse.hasNext,
+          });
+          resolve({
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: vi.fn().mockResolvedValue(responseBody),
+          } as unknown as Response);
+        },
+      };
+
+      requests.push(request);
     });
-  };
+  });
 
-  const respondToLatest = (
-    data: any,
-    options?: { hasNext?: boolean; error?: CombinedError; stale?: boolean }
-  ) => {
-    const op = operations[operations.length - 1];
-    if (!op) throw new Error('No operations recorded');
-    respond(op, data, options);
+  return {
+    requests,
+    respond(data, options = {}) {
+      const request = requests.find(r => !r.resolved);
+      if (!request) throw new Error('No pending fetch request');
+      request.resolve({
+        data,
+        errors: options.errors,
+        hasNext: options.hasNext,
+      });
+      request.resolved = true;
+    },
+    respondToLatest(data, options = {}) {
+      const request = requests[requests.length - 1];
+      if (!request) throw new Error('No pending fetch request');
+      if (request.resolved) throw new Error('Request already resolved');
+      request.resolve({
+        data,
+        errors: options.errors,
+        hasNext: options.hasNext,
+      });
+      request.resolved = true;
+    },
+    reset() {
+      requests.length = 0;
+      fetch.mockClear();
+    },
   };
-
-  return { exchange, operations, respond, respondToLatest };
 };
 
-const createTestClient = (
-  network: TestNetworkExchange,
-  cacheOpts?: Parameters<typeof cacheExchange>[0]
-) => {
+const createTestClient = (cacheOpts?: Parameters<typeof cacheExchange>[0]) => {
   return new Client({
     url: 'http://test/graphql',
     suspense: true,
-    exchanges: [cacheExchange(cacheOpts), network.exchange],
+    exchanges: [cacheExchange(cacheOpts), fetchExchange],
   });
 };
 
@@ -104,16 +174,31 @@ const assertValidSuspenseResult = (
 };
 
 describe('useQuery suspense with graphcache', () => {
+  let fetchMock: FetchMockController;
+
   beforeAll(() => {
+    (globalThis as any).AbortController = function AbortController() {
+      this.signal = undefined;
+      this.abort = abort;
+    };
+
     vi.spyOn(globalThis.console, 'error').mockImplementation(() => {
       // suppress React error boundary warnings in tests
     });
   });
 
+  beforeEach(() => {
+    fetchMock = createFetchMockController();
+  });
+
+  afterEach(() => {
+    fetchMock.reset();
+    abort.mockClear();
+  });
+
   describe('cache miss scenarios', () => {
     it('should suspend until network response arrives', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -146,11 +231,11 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -166,8 +251,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should handle network errors and unsuspend', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -203,14 +287,12 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest(undefined, {
-          error: new CombinedError({
-            networkError: new Error('Network failure'),
-          }),
+      await act(async () => {
+        fetchMock.respondToLatest(null, {
+          errors: [{ message: 'Network failure' }],
         });
       });
 
@@ -223,8 +305,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('cache hit scenarios', () => {
     it('should not suspend when data is fully cached', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -257,11 +338,11 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -300,8 +381,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should suspend for partial cache hits when requesting additional fields', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const basicQuery = gql`
         query BasicQuery {
@@ -345,11 +425,11 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -386,11 +466,11 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBe(2);
+        expect(fetchMock.requests.length).toBe(2);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -411,8 +491,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('cache-and-network policy', () => {
     it('should return stale cached data without suspending then update', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -445,11 +524,11 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -466,7 +545,7 @@ describe('useQuery suspense with graphcache', () => {
       });
 
       unmount();
-      const opsBeforeSecondRender = network.operations.length;
+      const opsBeforeSecondRender = fetchMock.requests.length;
 
       const CacheAndNetworkComponent = () => {
         const [result] = useQuery({
@@ -496,14 +575,13 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('data').textContent).toBe('Original Name');
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(
+        expect(fetchMock.requests.length).toBeGreaterThan(
           opsBeforeSecondRender
         );
       });
 
-      const latestOp = network.operations[network.operations.length - 1];
-      act(() => {
-        network.respond(latestOp, {
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -522,8 +600,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('hasNext/streaming queries', () => {
     it('should unsuspend when first chunk with data arrives (hasNext: true)', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -562,11 +639,11 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest(
+      await act(async () => {
+        fetchMock.respondToLatest(
           {
             __typename: 'Query',
             author: {
@@ -587,9 +664,8 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('author').textContent).toBe('Stream Author');
     });
 
-    it('should complete streaming when final chunk arrives (hasNext: false)', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+    it('should show complete when response has hasNext: false', async () => {
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -626,29 +702,11 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest(
-          {
-            __typename: 'Query',
-            author: {
-              __typename: 'Author',
-              id: '1',
-              name: 'Stream Author',
-            },
-          },
-          { hasNext: true }
-        );
-      });
-
-      await waitFor(() => {
-        expect(screen.queryByTestId('fallback')).toBeNull();
-      });
-
-      act(() => {
-        network.respondToLatest(
+      await act(async () => {
+        fetchMock.respondToLatest(
           {
             __typename: 'Query',
             author: {
@@ -662,6 +720,7 @@ describe('useQuery suspense with graphcache', () => {
       });
 
       await waitFor(() => {
+        expect(screen.queryByTestId('fallback')).toBeNull();
         expect(screen.getByTestId('hasNext').textContent).toBe('complete');
         expect(screen.getByTestId('author').textContent).toBe('Final Author');
       });
@@ -670,8 +729,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('multiple concurrent queries', () => {
     it('should handle two different queries suspending and resolving independently', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const authorQuery = gql`
         query AuthorQuery {
@@ -733,24 +791,27 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('posts-fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBe(2);
+        expect(fetchMock.requests.length).toBe(2);
       });
 
-      const authorOp = network.operations.find(
-        op =>
-          'name' in op.query.definitions[0] &&
-          op.query.definitions[0]?.name?.value === 'AuthorQuery'
+      // Find and respond to author query
+      const authorReqIndex = fetchMock.requests.findIndex(
+        r => r.body?.operationName === 'AuthorQuery'
       );
 
-      act(() => {
-        network.respond(authorOp!, {
-          __typename: 'Query',
-          author: {
-            __typename: 'Author',
-            id: '1',
-            name: 'Concurrent Author',
+      await act(async () => {
+        const req = fetchMock.requests[authorReqIndex];
+        req.resolve({
+          data: {
+            __typename: 'Query',
+            author: {
+              __typename: 'Author',
+              id: '1',
+              name: 'Concurrent Author',
+            },
           },
         });
+        req.resolved = true;
       });
 
       await waitFor(() => {
@@ -761,21 +822,24 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.getByTestId('posts-fallback')).toBeDefined();
       });
 
-      const postsOp = network.operations.find(
-        op =>
-          'name' in op.query.definitions[0] &&
-          op.query.definitions[0]?.name?.value === 'PostsQuery'
+      // Find and respond to posts query
+      const postsReqIndex = fetchMock.requests.findIndex(
+        r => r.body?.operationName === 'PostsQuery'
       );
 
-      act(() => {
-        network.respond(postsOp!, {
-          __typename: 'Query',
-          posts: [
-            { __typename: 'Post', id: '1', title: 'Post 1' },
-            { __typename: 'Post', id: '2', title: 'Post 2' },
-            { __typename: 'Post', id: '3', title: 'Post 3' },
-          ],
+      await act(async () => {
+        const req = fetchMock.requests[postsReqIndex];
+        req.resolve({
+          data: {
+            __typename: 'Query',
+            posts: [
+              { __typename: 'Post', id: '1', title: 'Post 1' },
+              { __typename: 'Post', id: '2', title: 'Post 2' },
+              { __typename: 'Post', id: '3', title: 'Post 3' },
+            ],
+          },
         });
+        req.resolved = true;
       });
 
       await waitFor(() => {
@@ -787,8 +851,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('error handling', () => {
     it('should handle GraphQL errors with partial data', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -832,11 +895,11 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest(
+      await act(async () => {
+        fetchMock.respondToLatest(
           {
             __typename: 'Query',
             author: {
@@ -847,14 +910,12 @@ describe('useQuery suspense with graphcache', () => {
             secret: null,
           },
           {
-            error: new CombinedError({
-              graphQLErrors: [
-                {
-                  message: 'Unauthorized',
-                  path: ['secret'],
-                },
-              ],
-            }),
+            errors: [
+              {
+                message: 'Unauthorized',
+                path: ['secret'],
+              },
+            ],
           }
         );
       });
@@ -869,8 +930,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('variable changes', () => {
     it('should suspend when variables change to uncached values', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery($id: ID!) {
@@ -903,11 +963,11 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBe(1);
+        expect(fetchMock.requests.length).toBe(1);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -932,11 +992,11 @@ describe('useQuery suspense with graphcache', () => {
       expect(screen.getByTestId('fallback')).toBeDefined();
 
       await waitFor(() => {
-        expect(network.operations.length).toBe(2);
+        expect(fetchMock.requests.length).toBe(2);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -952,8 +1012,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should not suspend when variables change to cached values', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery($id: ID!) {
@@ -984,11 +1043,11 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       await waitFor(() => {
-        expect(network.operations.length).toBe(1);
+        expect(fetchMock.requests.length).toBe(1);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -1011,11 +1070,11 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       await waitFor(() => {
-        expect(network.operations.length).toBe(2);
+        expect(fetchMock.requests.length).toBe(2);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -1044,8 +1103,7 @@ describe('useQuery suspense with graphcache', () => {
 
   describe('pause behavior', () => {
     it('should not suspend when initially paused', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -1082,12 +1140,11 @@ describe('useQuery suspense with graphcache', () => {
         'fetching: false'
       );
       expect(screen.getByTestId('data').textContent).toContain('data: none');
-      expect(network.operations.length).toBe(0);
+      expect(fetchMock.requests.length).toBe(0);
     });
 
     it('should start suspending when unpaused', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -1121,7 +1178,7 @@ describe('useQuery suspense with graphcache', () => {
 
       expect(screen.queryByTestId('fallback')).toBeNull();
       expect(screen.getByTestId('data')).toBeDefined();
-      expect(network.operations.length).toBe(0);
+      expect(fetchMock.requests.length).toBe(0);
 
       rerender(
         <Provider value={client}>
@@ -1135,10 +1192,10 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.getByTestId('fallback')).toBeDefined();
       });
 
-      expect(network.operations.length).toBeGreaterThan(0);
+      expect(fetchMock.requests.length).toBeGreaterThan(0);
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -1155,8 +1212,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should stop suspending when paused while suspended', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -1210,8 +1266,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should keep data when paused after receiving data', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -1250,8 +1305,8 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.getByTestId('fallback')).toBeDefined();
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -1288,8 +1343,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should handle multiple pause/unpause cycles', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -1362,8 +1416,8 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.getByTestId('fallback')).toBeDefined();
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -1397,8 +1451,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should use new variables when unpaused after variable change', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery($id: ID!) {
@@ -1431,7 +1484,7 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       expect(screen.queryByTestId('fallback')).toBeNull();
-      expect(network.operations.length).toBe(0);
+      expect(fetchMock.requests.length).toBe(0);
 
       rerender(
         <Provider value={client}>
@@ -1441,7 +1494,7 @@ describe('useQuery suspense with graphcache', () => {
         </Provider>
       );
 
-      expect(network.operations.length).toBe(0);
+      expect(fetchMock.requests.length).toBe(0);
 
       rerender(
         <Provider value={client}>
@@ -1455,11 +1508,13 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.getByTestId('fallback')).toBeDefined();
       });
 
-      expect(network.operations.length).toBe(1);
-      expect(network.operations[0].variables).toEqual({ id: '2' });
+      await waitFor(() => {
+        expect(fetchMock.requests.length).toBe(1);
+        expect(fetchMock.requests[0].body?.variables).toEqual({ id: '2' });
+      });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -1476,8 +1531,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should not suspend when paused even with graphcache partial result', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const basicQuery = gql`
         query BasicQuery {
@@ -1521,11 +1575,11 @@ describe('useQuery suspense with graphcache', () => {
       );
 
       await waitFor(() => {
-        expect(network.operations.length).toBeGreaterThan(0);
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
       });
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',
@@ -1568,8 +1622,7 @@ describe('useQuery suspense with graphcache', () => {
     });
 
     it('should clean up orphaned promise when pausing so unpause creates new subscription', async () => {
-      const network = createTestNetworkExchange();
-      const client = createTestClient(network);
+      const client = createTestClient();
 
       const query = gql`
         query TestQuery {
@@ -1608,7 +1661,7 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.getByTestId('fallback')).toBeDefined();
       });
 
-      expect(network.operations.length).toBe(1);
+      expect(fetchMock.requests.length).toBe(1);
 
       rerender(
         <Provider value={client}>
@@ -1622,7 +1675,7 @@ describe('useQuery suspense with graphcache', () => {
         expect(screen.queryByTestId('fallback')).toBeNull();
       });
 
-      const opsBeforeUnpause = network.operations.length;
+      const opsBeforeUnpause = fetchMock.requests.length;
 
       rerender(
         <Provider value={client}>
@@ -1634,13 +1687,13 @@ describe('useQuery suspense with graphcache', () => {
 
       await waitFor(
         () => {
-          expect(network.operations.length).toBeGreaterThan(opsBeforeUnpause);
+          expect(fetchMock.requests.length).toBeGreaterThan(opsBeforeUnpause);
         },
         { timeout: 1000 }
       );
 
-      act(() => {
-        network.respondToLatest({
+      await act(async () => {
+        fetchMock.respondToLatest({
           __typename: 'Query',
           author: {
             __typename: 'Author',

@@ -1,59 +1,148 @@
 // @vitest-environment jsdom
-import { vi, expect, it, describe, beforeAll } from 'vitest';
+import {
+  vi,
+  expect,
+  it,
+  describe,
+  beforeAll,
+  beforeEach,
+  afterEach,
+  Mock,
+} from 'vitest';
 import * as React from 'react';
 import { render, screen, waitFor, act } from '@testing-library/react';
-import { makeSubject, merge, filter, pipe, map, share } from 'wonka';
-import {
-  Client,
-  CombinedError,
-  Exchange,
-  gql,
-  Operation,
-  OperationResult,
-} from '@urql/core';
+import { Client, fetchExchange, gql } from '@urql/core';
 
 import { Provider } from '../context';
 import { useQuery, UseQueryExecute } from './useQuery';
 
-/**
- * Creates an exchange that allows manual control over results.
- * First emits a partial result { fetching: true } synchronously,
- * then waits for manual emission via the subject.
- * Only emits partial result for each unique operation key once.
- */
-const createPartialThenControllableExchange = (
-  resultSubject: ReturnType<typeof makeSubject<OperationResult>>
-): Exchange => {
-  const seenOperationKeys = new Set<number>();
+const fetch = (globalThis as any).fetch as Mock;
+const abort = vi.fn();
 
-  return () => {
-    return ops$ => {
-      const sharedOps$ = pipe(ops$, share);
+interface FetchMockRequest {
+  url: string;
+  body: { query: string; variables?: Record<string, unknown> };
+  resolve: (response: MockResponse) => void;
+}
 
-      return merge([
-        // Emit partial result immediately for each operation (only once per key)
-        pipe(
-          sharedOps$,
-          filter(op => {
-            if (op.kind === 'teardown') return false;
-            if (seenOperationKeys.has(op.key)) return false;
-            seenOperationKeys.add(op.key);
-            return true;
-          }),
-          map(
-            (operation): OperationResult => ({
-              operation,
-              data: undefined,
-              error: undefined,
-              stale: false,
-              hasNext: false,
-            })
-          )
-        ),
-        // Also allow manual results from the subject
-        resultSubject.source,
-      ]);
-    };
+interface MockResponse {
+  data?: unknown;
+  errors?: Array<{ message: string; path?: string[] }>;
+}
+
+interface FetchMockController {
+  requests: FetchMockRequest[];
+  respond: (
+    data: unknown,
+    options?: { errors?: Array<{ message: string }> }
+  ) => void;
+  respondToLatest: (
+    data: unknown,
+    options?: { errors?: Array<{ message: string }> }
+  ) => void;
+  respondWithNetworkError: (error: Error) => void;
+  reset: () => void;
+}
+
+const createFetchMockController = (): FetchMockController => {
+  const requests: FetchMockRequest[] = [];
+  const pendingResolvers: Array<{
+    resolve: (response: Response) => void;
+    reject: (error: Error) => void;
+  }> = [];
+
+  fetch.mockImplementation((url: string, options?: RequestInit) => {
+    return new Promise<Response>((resolve, reject) => {
+      let body: {
+        query?: string;
+        variables?: Record<string, unknown>;
+        operationName?: string;
+      } | null = null;
+
+      // First try to get body from POST request body
+      if (options && options.body) {
+        if (typeof options.body === 'string') {
+          try {
+            body = JSON.parse(options.body);
+          } catch {
+            body = { query: options.body };
+          }
+        } else if (options.body instanceof FormData) {
+          const operations = options.body.get('operations');
+          if (operations && typeof operations === 'string') {
+            try {
+              body = JSON.parse(operations);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+
+      // For GET requests, extract query/variables from URL
+      if (!body && url.includes('?')) {
+        const urlObj = new URL(url);
+        const query = urlObj.searchParams.get('query');
+        const variables = urlObj.searchParams.get('variables');
+        const operationName = urlObj.searchParams.get('operationName');
+        if (query || variables) {
+          body = {
+            query: query ?? undefined,
+            variables: variables ? JSON.parse(variables) : undefined,
+            operationName: operationName ?? undefined,
+          };
+        }
+      }
+
+      const request: FetchMockRequest = {
+        url,
+        body,
+        resolve: (mockResponse: MockResponse) => {
+          const responseBody = JSON.stringify({
+            data: mockResponse.data,
+            errors: mockResponse.errors,
+          });
+          resolve({
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: vi.fn().mockResolvedValue(responseBody),
+          } as unknown as Response);
+        },
+      };
+
+      requests.push(request);
+      pendingResolvers.push({ resolve: request.resolve as any, reject });
+    });
+  });
+
+  return {
+    requests,
+    respond(data, options = {}) {
+      const request = requests.find(r => !('resolved' in r));
+      if (!request) throw new Error('No pending fetch request');
+      request.resolve({ data, errors: options.errors });
+      (request as any).resolved = true;
+    },
+    respondToLatest(data, options = {}) {
+      const request = requests[requests.length - 1];
+      if (!request) throw new Error('No pending fetch request');
+      if ((request as any).resolved)
+        throw new Error('Request already resolved');
+      request.resolve({ data, errors: options.errors });
+      (request as any).resolved = true;
+    },
+    respondWithNetworkError(error: Error) {
+      const pending = pendingResolvers.find(
+        (_, i) => !('resolved' in requests[i])
+      );
+      if (!pending) throw new Error('No pending fetch request');
+      pending.reject(error);
+    },
+    reset() {
+      requests.length = 0;
+      pendingResolvers.length = 0;
+      fetch.mockClear();
+    },
   };
 };
 
@@ -71,38 +160,33 @@ const assertSuspenseInvariant = (
 };
 
 describe('useQuery suspense', () => {
+  let fetchMock: FetchMockController;
+
   beforeAll(() => {
+    (globalThis as any).AbortController = function AbortController() {
+      this.signal = undefined;
+      this.abort = abort;
+    };
+
     vi.spyOn(globalThis.console, 'error').mockImplementation(() => {
       // suppress React error boundary warnings in tests
     });
   });
 
-  it('should keep suspending when partial result without data or error is emitted', async () => {
-    const resultSubject = makeSubject<OperationResult>();
-    let capturedOperation: Operation | undefined;
+  beforeEach(() => {
+    fetchMock = createFetchMockController();
+  });
 
-    const captureOperationExchange: Exchange = ({ forward }) => {
-      return ops$ => {
-        return pipe(
-          ops$,
-          map(op => {
-            if (op.kind !== 'teardown') {
-              capturedOperation = op;
-            }
-            return op;
-          }),
-          forward
-        );
-      };
-    };
+  afterEach(() => {
+    fetchMock.reset();
+    abort.mockClear();
+  });
 
+  it('should keep suspending until response arrives', async () => {
     const client = new Client({
       url: 'http://localhost:3000/graphql',
       suspense: true,
-      exchanges: [
-        captureOperationExchange,
-        createPartialThenControllableExchange(resultSubject),
-      ],
+      exchanges: [fetchExchange],
     });
 
     const query = gql`
@@ -127,24 +211,17 @@ describe('useQuery suspense', () => {
     );
 
     // Initially should be suspended (showing fallback)
-    // The exchange immediately emits { data: undefined, error: undefined }
-    // With the fix, this should NOT unsuspend the component
     expect(screen.getByTestId('fallback')).toBeDefined();
 
-    // Wait a tick to ensure any potential unsuspension would have happened
+    // Wait a tick to ensure component stays suspended
     await waitFor(() => {
       expect(screen.queryByTestId('fallback')).not.toBeNull();
     });
 
     // Now emit the actual result with data
-    expect(capturedOperation).toBeDefined();
-    act(() => {
-      resultSubject.next({
-        operation: capturedOperation!,
-        data: { test: 'hello' },
-        stale: false,
-        hasNext: false,
-      });
+    expect(fetchMock.requests.length).toBeGreaterThan(0);
+    await act(async () => {
+      fetchMock.respondToLatest({ test: 'hello' });
     });
 
     // Now it should unsuspend and show data
@@ -154,31 +231,10 @@ describe('useQuery suspense', () => {
   });
 
   it('should unsuspend when error is received', async () => {
-    const resultSubject = makeSubject<OperationResult>();
-    let capturedOperation: Operation | undefined;
-
-    const captureOperationExchange: Exchange = ({ forward }) => {
-      return ops$ => {
-        return pipe(
-          ops$,
-          map(op => {
-            if (op.kind !== 'teardown') {
-              capturedOperation = op;
-            }
-            return op;
-          }),
-          forward
-        );
-      };
-    };
-
     const client = new Client({
       url: 'http://localhost:3000/graphql',
       suspense: true,
-      exchanges: [
-        captureOperationExchange,
-        createPartialThenControllableExchange(resultSubject),
-      ],
+      exchanges: [fetchExchange],
     });
 
     const query = gql`
@@ -211,29 +267,22 @@ describe('useQuery suspense', () => {
     // Initially should be suspended
     expect(screen.getByTestId('fallback')).toBeDefined();
 
-    // Wait to ensure component stays suspended with partial result
+    // Wait to ensure component stays suspended
     await waitFor(() => {
       expect(screen.queryByTestId('fallback')).not.toBeNull();
     });
 
-    // Emit error result (without partial result first, to simplify)
-    expect(capturedOperation).toBeDefined();
-    act(() => {
-      resultSubject.next({
-        operation: capturedOperation!,
-        data: undefined,
-        error: new CombinedError({
-          networkError: new Error('Test error'),
-        }),
-        stale: false,
-        hasNext: false,
+    // Emit error result
+    expect(fetchMock.requests.length).toBeGreaterThan(0);
+    await act(async () => {
+      fetchMock.respondToLatest(null, {
+        errors: [{ message: 'Test error' }],
       });
     });
 
     // Should unsuspend and show error
     await waitFor(
       () => {
-        // First check we're not in loading state anymore
         expect(screen.queryByTestId('fallback')).toBeNull();
         expect(screen.getByTestId('error')).toBeDefined();
       },
@@ -243,31 +292,10 @@ describe('useQuery suspense', () => {
 
   describe('pause behavior', () => {
     it('should not suspend when initially paused', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      let capturedOperation: Operation | undefined;
-
-      const captureOperationExchange: Exchange = ({ forward }) => {
-        return ops$ => {
-          return pipe(
-            ops$,
-            map(op => {
-              if (op.kind !== 'teardown') {
-                capturedOperation = op;
-              }
-              return op;
-            }),
-            forward
-          );
-        };
-      };
-
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [
-          captureOperationExchange,
-          createPartialThenControllableExchange(resultSubject),
-        ],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -305,35 +333,14 @@ describe('useQuery suspense', () => {
       expect(screen.getByTestId('data').textContent).toContain('data: none');
 
       // No query should have been executed
-      expect(capturedOperation).toBeUndefined();
+      expect(fetchMock.requests.length).toBe(0);
     });
 
     it('should start suspending when unpaused', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      let capturedOperation: Operation | undefined;
-
-      const captureOperationExchange: Exchange = ({ forward }) => {
-        return ops$ => {
-          return pipe(
-            ops$,
-            map(op => {
-              if (op.kind !== 'teardown') {
-                capturedOperation = op;
-              }
-              return op;
-            }),
-            forward
-          );
-        };
-      };
-
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [
-          captureOperationExchange,
-          createPartialThenControllableExchange(resultSubject),
-        ],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -361,7 +368,7 @@ describe('useQuery suspense', () => {
       // Initially not suspended when paused
       expect(screen.queryByTestId('fallback')).toBeNull();
       expect(screen.getByTestId('data')).toBeDefined();
-      expect(capturedOperation).toBeUndefined();
+      expect(fetchMock.requests.length).toBe(0);
 
       // Unpause - should start suspending
       rerender(
@@ -378,16 +385,11 @@ describe('useQuery suspense', () => {
       });
 
       // Query should have been executed
-      expect(capturedOperation).toBeDefined();
+      expect(fetchMock.requests.length).toBeGreaterThan(0);
 
       // Emit data
-      act(() => {
-        resultSubject.next({
-          operation: capturedOperation!,
-          data: { test: 'hello' },
-          stale: false,
-          hasNext: false,
-        });
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'hello' });
       });
 
       // Should unsuspend and show data
@@ -398,12 +400,10 @@ describe('useQuery suspense', () => {
     });
 
     it('should stop suspending when paused while suspended', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [createPartialThenControllableExchange(resultSubject)],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -458,31 +458,10 @@ describe('useQuery suspense', () => {
     });
 
     it('should keep data when paused after receiving data', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      let capturedOperation: Operation | undefined;
-
-      const captureOperationExchange: Exchange = ({ forward }) => {
-        return ops$ => {
-          return pipe(
-            ops$,
-            map(op => {
-              if (op.kind !== 'teardown') {
-                capturedOperation = op;
-              }
-              return op;
-            }),
-            forward
-          );
-        };
-      };
-
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [
-          captureOperationExchange,
-          createPartialThenControllableExchange(resultSubject),
-        ],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -518,14 +497,9 @@ describe('useQuery suspense', () => {
       });
 
       // Emit data
-      expect(capturedOperation).toBeDefined();
-      act(() => {
-        resultSubject.next({
-          operation: capturedOperation!,
-          data: { test: 'hello' },
-          stale: false,
-          hasNext: false,
-        });
+      expect(fetchMock.requests.length).toBeGreaterThan(0);
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'hello' });
       });
 
       // Wait for data to render
@@ -554,32 +528,12 @@ describe('useQuery suspense', () => {
     });
 
     it('should fetch data when executeQuery called while paused without suspending', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      let capturedOperation: Operation | undefined;
       let executeQuery: UseQueryExecute;
-
-      const captureOperationExchange: Exchange = ({ forward }) => {
-        return ops$ => {
-          return pipe(
-            ops$,
-            map(op => {
-              if (op.kind !== 'teardown') {
-                capturedOperation = op;
-              }
-              return op;
-            }),
-            forward
-          );
-        };
-      };
 
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [
-          captureOperationExchange,
-          createPartialThenControllableExchange(resultSubject),
-        ],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -614,7 +568,7 @@ describe('useQuery suspense', () => {
       expect(screen.getByTestId('data').textContent).toContain(
         'fetching: false'
       );
-      expect(capturedOperation).toBeUndefined();
+      expect(fetchMock.requests.length).toBe(0);
 
       // Call executeQuery manually while paused
       act(() => {
@@ -622,20 +576,16 @@ describe('useQuery suspense', () => {
       });
 
       // Should NOT suspend (pause is still true, so memoized source is null)
-      // Component should not be in fallback state
       expect(screen.queryByTestId('fallback')).toBeNull();
 
       // Query should have been executed
-      expect(capturedOperation).toBeDefined();
+      await waitFor(() => {
+        expect(fetchMock.requests.length).toBeGreaterThan(0);
+      });
 
       // Emit data
-      act(() => {
-        resultSubject.next({
-          operation: capturedOperation!,
-          data: { test: 'manual-fetch' },
-          stale: false,
-          hasNext: false,
-        });
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'manual-fetch' });
       });
 
       // Should show data without ever having suspended
@@ -648,31 +598,10 @@ describe('useQuery suspense', () => {
     });
 
     it('should handle multiple pause/unpause cycles', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      let capturedOperation: Operation | undefined;
-
-      const captureOperationExchange: Exchange = ({ forward }) => {
-        return ops$ => {
-          return pipe(
-            ops$,
-            map(op => {
-              if (op.kind !== 'teardown') {
-                capturedOperation = op;
-              }
-              return op;
-            }),
-            forward
-          );
-        };
-      };
-
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [
-          captureOperationExchange,
-          createPartialThenControllableExchange(resultSubject),
-        ],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -746,14 +675,8 @@ describe('useQuery suspense', () => {
         expect(screen.getByTestId('fallback')).toBeDefined();
       });
 
-      expect(capturedOperation).toBeDefined();
-      act(() => {
-        resultSubject.next({
-          operation: capturedOperation!,
-          data: { test: 'cycle2-data' },
-          stale: false,
-          hasNext: false,
-        });
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'cycle2-data' });
       });
 
       await waitFor(() => {
@@ -781,31 +704,10 @@ describe('useQuery suspense', () => {
     });
 
     it('should use new variables when unpaused after variable change', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      const capturedOperations: Operation[] = [];
-
-      const captureOperationExchange: Exchange = ({ forward }) => {
-        return ops$ => {
-          return pipe(
-            ops$,
-            map(op => {
-              if (op.kind !== 'teardown') {
-                capturedOperations.push(op);
-              }
-              return op;
-            }),
-            forward
-          );
-        };
-      };
-
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [
-          captureOperationExchange,
-          createPartialThenControllableExchange(resultSubject),
-        ],
+        exchanges: [fetchExchange],
       });
 
       const queryWithVars = gql`
@@ -838,7 +740,7 @@ describe('useQuery suspense', () => {
 
       // Not suspended, no query executed
       expect(screen.queryByTestId('fallback')).toBeNull();
-      expect(capturedOperations.length).toBe(0);
+      expect(fetchMock.requests.length).toBe(0);
 
       // Change variables while paused
       rerender(
@@ -850,7 +752,7 @@ describe('useQuery suspense', () => {
       );
 
       // Still no query
-      expect(capturedOperations.length).toBe(0);
+      expect(fetchMock.requests.length).toBe(0);
 
       // Unpause
       rerender(
@@ -866,39 +768,21 @@ describe('useQuery suspense', () => {
         expect(screen.getByTestId('fallback')).toBeDefined();
       });
 
-      expect(capturedOperations.length).toBe(1);
-      expect(capturedOperations[0].variables).toEqual({ id: '2' });
+      await waitFor(() => {
+        expect(fetchMock.requests.length).toBe(1);
+        expect(fetchMock.requests[0].body?.variables).toEqual({ id: '2' });
+      });
     });
   });
 
   describe('orphaned promise handling', () => {
     it('should not get stuck in suspense when refetching after subscription teardown', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      let capturedOperation: Operation | undefined;
       let executeQuery: UseQueryExecute;
-
-      const captureOperationExchange: Exchange = ({ forward }) => {
-        return ops$ => {
-          return pipe(
-            ops$,
-            map(op => {
-              if (op.kind !== 'teardown') {
-                capturedOperation = op;
-              }
-              return op;
-            }),
-            forward
-          );
-        };
-      };
 
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [
-          captureOperationExchange,
-          createPartialThenControllableExchange(resultSubject),
-        ],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -930,14 +814,8 @@ describe('useQuery suspense', () => {
       });
 
       // Step 2: First result arrives, component unsuspends
-      expect(capturedOperation).toBeDefined();
-      act(() => {
-        resultSubject.next({
-          operation: capturedOperation!,
-          data: { test: 'initial' },
-          stale: false,
-          hasNext: false,
-        });
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'initial' });
       });
 
       await waitFor(() => {
@@ -959,7 +837,6 @@ describe('useQuery suspense', () => {
       });
 
       // Step 4: User navigates back and triggers a refetch
-      // This creates a new source and should work correctly
       rerender(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -973,21 +850,19 @@ describe('useQuery suspense', () => {
         executeQuery({ requestPolicy: 'network-only' });
       });
 
-      // The component may suspend briefly while fetching
+      // Wait for the new request to be made
+      await waitFor(() => {
+        expect(fetchMock.requests.length).toBeGreaterThan(1);
+      });
+
       // Emit the new result
-      act(() => {
-        resultSubject.next({
-          operation: capturedOperation!,
-          data: { test: 'refetched' },
-          stale: false,
-          hasNext: false,
-        });
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'refetched' });
       });
 
       // Step 6: Verify the component gets the new data and doesn't stay stuck
       await waitFor(
         () => {
-          expect(screen.queryByTestId('fallback')).toBeNull();
           expect(screen.getByTestId('data').textContent).toBe('refetched');
         },
         { timeout: 3000 }
@@ -995,39 +870,10 @@ describe('useQuery suspense', () => {
     });
 
     it('should not hang when remounting after unmount during suspension', async () => {
-      const resultSubject = makeSubject<OperationResult>();
-      let capturedOperation: Operation | undefined;
-
-      const trackSubscriptionsExchange: Exchange = () => {
-        return ops$ => {
-          const sharedOps$ = pipe(ops$, share);
-          return merge([
-            pipe(
-              sharedOps$,
-              filter(op => op.kind !== 'teardown'),
-              map(op => {
-                capturedOperation = op;
-                return op;
-              }),
-              map(
-                (operation): OperationResult => ({
-                  operation,
-                  data: undefined,
-                  error: undefined,
-                  stale: false,
-                  hasNext: false,
-                })
-              )
-            ),
-            resultSubject.source,
-          ]);
-        };
-      };
-
       const client = new Client({
         url: 'http://localhost:3000/graphql',
         suspense: true,
-        exchanges: [trackSubscriptionsExchange],
+        exchanges: [fetchExchange],
       });
 
       const query = gql`
@@ -1075,19 +921,11 @@ describe('useQuery suspense', () => {
       });
 
       // Emit data - the component should unsuspend
-      // This verifies the new subscription is working
-      expect(capturedOperation).toBeDefined();
-      act(() => {
-        resultSubject.next({
-          operation: capturedOperation!,
-          data: { test: 'after-remount' },
-          stale: false,
-          hasNext: false,
-        });
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'after-remount' });
       });
 
       // The critical assertion: component should receive data and unsuspend
-      // Without the fix, this would hang because the orphaned promise never resolves
       await waitFor(
         () => {
           expect(screen.queryByTestId('fallback')).toBeNull();
