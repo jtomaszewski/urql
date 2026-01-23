@@ -935,4 +935,67 @@ describe('useQuery suspense', () => {
       );
     });
   });
+
+  describe('suspense invariant edge cases', () => {
+    it('should not return { fetching: false } without data when source is null but suspense is enabled', async () => {
+      const client = new Client({
+        url: 'http://localhost:3000/graphql',
+        suspense: true,
+        exchanges: [fetchExchange],
+      });
+
+      const query = gql`
+        query TestQuery {
+          test
+        }
+      `;
+
+      const TestComponent = ({ pause }: { pause: boolean }) => {
+        const [result] = useQuery({ query, pause });
+        assertSuspenseInvariant(pause, result.data, result.error);
+        return (
+          <div data-testid="data">
+            {result.data?.test ?? 'no data'} (fetching:{' '}
+            {String(result.fetching)})
+          </div>
+        );
+      };
+
+      const Fallback = () => <div data-testid="fallback">Loading...</div>;
+
+      const { rerender } = render(
+        <Provider value={client}>
+          <React.Suspense fallback={<Fallback />}>
+            <TestComponent pause={true} />
+          </React.Suspense>
+        </Provider>
+      );
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('fallback')).toBeNull();
+        expect(screen.getByTestId('data').textContent).toContain('no data');
+      });
+
+      rerender(
+        <Provider value={client}>
+          <React.Suspense fallback={<Fallback />}>
+            <TestComponent pause={false} />
+          </React.Suspense>
+        </Provider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('fallback')).toBeDefined();
+      });
+
+      await act(async () => {
+        fetchMock.respondToLatest({ test: 'success' });
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('fallback')).toBeNull();
+        expect(screen.getByTestId('data').textContent).toContain('success');
+      });
+    });
+  });
 });

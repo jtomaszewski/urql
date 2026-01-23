@@ -1735,4 +1735,58 @@ describe('useQuery suspense with graphcache', () => {
       });
     });
   });
+
+  describe('suspense invariant edge cases', () => {
+    it('should not return cached result without data in suspense mode', async () => {
+      const client = createTestClient();
+
+      const query = gql`
+        query GetAuthor($id: ID!) {
+          author(id: $id) {
+            id
+            name
+          }
+        }
+      `;
+
+      const TestComponent = () => {
+        const [result] = useQuery({
+          query,
+          variables: { id: '1' },
+        });
+        assertValidSuspenseResult(result);
+        return (
+          <div data-testid="data">
+            {result.data?.author?.name ?? 'no data'} (fetching:{' '}
+            {String(result.fetching)})
+          </div>
+        );
+      };
+
+      const Fallback = () => <div data-testid="fallback">Loading...</div>;
+
+      render(
+        <Provider value={client}>
+          <React.Suspense fallback={<Fallback />}>
+            <TestComponent />
+          </React.Suspense>
+        </Provider>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('fallback')).toBeDefined();
+      });
+
+      await act(async () => {
+        fetchMock.respondToLatest({
+          __typename: 'Query',
+          author: null,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('fallback')).toBeNull();
+      });
+    });
+  });
 });
