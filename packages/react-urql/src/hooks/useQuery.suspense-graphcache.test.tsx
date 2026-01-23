@@ -20,7 +20,8 @@ import {
   setupSuspenseTestEnvironment,
   assertSuspenseInvariant,
   FetchMockController,
-} from './suspense-test-utils';
+  Fallback,
+} from './suspense-test-utils.js';
 
 const abort = vi.fn();
 
@@ -61,8 +62,6 @@ describe('useQuery suspense with graphcache', () => {
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       render(
         <Provider value={client}>
@@ -118,8 +117,6 @@ describe('useQuery suspense with graphcache', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -170,8 +167,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { unmount } = render(
         <Provider value={client}>
@@ -257,8 +252,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { unmount } = render(
         <Provider value={client}>
@@ -356,8 +349,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { unmount } = render(
         <Provider value={client}>
@@ -470,8 +461,6 @@ describe('useQuery suspense with graphcache', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -534,8 +523,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       render(
         <Provider value={client}>
@@ -724,8 +711,6 @@ describe('useQuery suspense with graphcache', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -791,8 +776,6 @@ describe('useQuery suspense with graphcache', () => {
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -873,8 +856,6 @@ describe('useQuery suspense with graphcache', () => {
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -967,8 +948,6 @@ describe('useQuery suspense with graphcache', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -1000,15 +979,11 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = ({ pause }: { pause: boolean }) => {
         const [result] = useQuery({ query, pause });
-        if (!pause) {
-          assertSuspenseInvariant(result, pause);
-        }
+        assertSuspenseInvariant(result, pause);
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'no data'}</div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -1076,8 +1051,6 @@ describe('useQuery suspense with graphcache', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       const { rerender } = render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -1122,9 +1095,7 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = ({ pause }: { pause: boolean }) => {
         const [result] = useQuery({ query, pause });
-        if (!pause) {
-          assertSuspenseInvariant(result, pause);
-        }
+        assertSuspenseInvariant(result, pause);
         return (
           <div data-testid="data">
             fetching: {String(result.fetching)}, data:{' '}
@@ -1132,8 +1103,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -1206,8 +1175,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -1307,15 +1274,11 @@ describe('useQuery suspense with graphcache', () => {
 
       const TestComponent = ({ pause, id }: { pause: boolean; id: string }) => {
         const [result] = useQuery({ query, variables: { id }, pause });
-        if (!pause) {
-          assertSuspenseInvariant(result, pause);
-        }
+        assertSuspenseInvariant(result, pause);
         return (
           <div data-testid="data">{result.data?.author?.name ?? 'none'}</div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -1406,8 +1369,6 @@ describe('useQuery suspense with graphcache', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       const { unmount } = render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -1480,9 +1441,7 @@ describe('useQuery suspense with graphcache', () => {
       const TestComponent = ({ pause }: { pause: boolean }) => {
         const [result, execute] = useQuery({ query, pause });
         executeQuery = execute;
-        if (!pause) {
-          assertSuspenseInvariant(result, pause);
-        }
+        assertSuspenseInvariant(result, pause);
         return (
           <div data-testid="data">
             fetching: {String(result.fetching)}, data:{' '}
@@ -1490,8 +1449,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -1600,8 +1557,6 @@ describe('useQuery suspense with graphcache', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       render(
         <Provider value={client}>

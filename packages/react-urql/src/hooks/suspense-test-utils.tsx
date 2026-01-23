@@ -1,5 +1,6 @@
 import type { Mock } from 'vitest';
 import { vi } from 'vitest';
+import * as React from 'react';
 import { Client, fetchExchange } from '@urql/core';
 import { cacheExchange } from '@urql/exchange-graphcache';
 
@@ -197,3 +198,5 @@ export const createTestClient = (options: CreateTestClientOptions = {}) => {
     exchanges,
   });
 };
+
+export const Fallback = () => <div data-testid="fallback">Loading...</div>;

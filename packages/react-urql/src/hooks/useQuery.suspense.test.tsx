@@ -20,7 +20,8 @@ import {
   setupSuspenseTestEnvironment,
   assertSuspenseInvariant,
   FetchMockController,
-} from './suspense-test-utils';
+  Fallback,
+} from './suspense-test-utils.js';
 
 const abort = vi.fn();
 
@@ -53,8 +54,6 @@ describe('useQuery suspense', () => {
       const [result] = useQuery({ query });
       return <div data-testid="data">{result.data?.test ?? 'no data'}</div>;
     };
-
-    const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
     render(
       <Provider value={client}>
@@ -99,8 +98,6 @@ describe('useQuery suspense', () => {
       }
       return <div data-testid="loading">loading state</div>;
     };
-
-    const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
     render(
       <Provider value={client}>
@@ -153,8 +150,6 @@ describe('useQuery suspense', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -186,8 +181,6 @@ describe('useQuery suspense', () => {
         assertSuspenseInvariant(result, pause);
         return <div data-testid="data">{result.data?.test ?? 'no data'}</div>;
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -245,8 +238,6 @@ describe('useQuery suspense', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       const { rerender } = render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -295,8 +286,6 @@ describe('useQuery suspense', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -359,8 +348,6 @@ describe('useQuery suspense', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -416,8 +403,6 @@ describe('useQuery suspense', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -516,8 +501,6 @@ describe('useQuery suspense', () => {
         );
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       const { rerender } = render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -576,8 +559,6 @@ describe('useQuery suspense', () => {
         assertSuspenseInvariant(result, pause);
         return <div data-testid="data">{result.data?.test ?? 'no data'}</div>;
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
@@ -655,8 +636,6 @@ describe('useQuery suspense', () => {
         return <div data-testid="data">{result.data?.test ?? 'no data'}</div>;
       };
 
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
-
       const { unmount } = render(
         <Provider value={client}>
           <React.Suspense fallback={<Fallback />}>
@@ -717,8 +696,6 @@ describe('useQuery suspense', () => {
           </div>
         );
       };
-
-      const Fallback = () => <div data-testid="fallback">Loading...</div>;
 
       const { rerender } = render(
         <Provider value={client}>
