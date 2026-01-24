@@ -277,8 +277,8 @@ export function useQuery<
             if (debug) {
               console.log('[useQuery] onPush (suspense cache set)', {
                 requestKey: request.key,
-                hasData: 'data' in result && result.data !== undefined,
-                hasError: 'error' in result && result.error !== undefined,
+                data: result.data,
+                error: result.error,
                 stale: result.stale,
                 hasNext: result.hasNext,
               });
@@ -325,16 +325,8 @@ export function useQuery<
           requestKey: request.key,
           cacheHit: !!result,
           isPromise: result != null && 'then' in result,
-          hasData:
-            result &&
-            !('then' in result) &&
-            'data' in result &&
-            result.data !== undefined,
-          hasError:
-            result &&
-            !('then' in result) &&
-            'error' in result &&
-            result.error !== undefined,
+          data: (result as any)?.data,
+          error: (result as any)?.error,
         });
       }
 
@@ -369,8 +361,8 @@ export function useQuery<
               console.log(
                 '[useQuery] getSnapshot subscription received result',
                 {
-                  hasData: 'data' in _result && _result.data !== undefined,
-                  hasError: 'error' in _result && _result.error !== undefined,
+                  data: _result.data,
+                  error: _result.error,
                   stale: _result.stale,
                   hasNext: _result.hasNext,
                 }
@@ -418,8 +410,8 @@ export function useQuery<
       };
       if (debug) {
         console.log('[useQuery] getSnapshot: returning result', {
-          hasData: 'data' in finalResult && finalResult.data !== undefined,
-          hasError: 'error' in finalResult && finalResult.error !== undefined,
+          data: finalResult.data,
+          error: finalResult.error,
           fetching: 'fetching' in finalResult ? finalResult.fetching : 'N/A',
         });
       }
@@ -482,8 +474,8 @@ export function useQuery<
     const updateResult = (result: Partial<UseQueryState<Data, Variables>>) => {
       if (debug) {
         console.log('[useQuery] useEffect updateResult', {
-          hasData: 'data' in result && result.data !== undefined,
-          hasError: 'error' in result && result.error !== undefined,
+          data: result.data,
+          error: result.error,
           fetching: 'fetching' in result ? result.fetching : 'N/A',
           stale: 'stale' in result ? result.stale : 'N/A',
         });
@@ -512,8 +504,8 @@ export function useQuery<
         subscribe(result => {
           if (debug) {
             console.log('[useQuery] useEffect subscription received', {
-              hasData: 'data' in result && result.data !== undefined,
-              hasError: 'error' in result && result.error !== undefined,
+              data: result.data,
+              error: result.error,
               stale: result.stale,
               hasNext: result.hasNext,
             });
@@ -571,8 +563,8 @@ export function useQuery<
                     '[useQuery] executeQuery onPush (suspense cache set)',
                     {
                       requestKey: request.key,
-                      hasData: 'data' in result && result.data !== undefined,
-                      hasError: 'error' in result && result.error !== undefined,
+                      data: result.data,
+                      error: result.error,
                     }
                   );
                 }
@@ -598,8 +590,8 @@ export function useQuery<
   if (debug) {
     console.log('[useQuery] returning result', {
       fetching: currentResult.fetching,
-      hasData: currentResult.data !== undefined,
-      hasError: currentResult.error !== undefined,
+      data: currentResult.data,
+      error: currentResult.error,
       stale: currentResult.stale,
     });
   }
