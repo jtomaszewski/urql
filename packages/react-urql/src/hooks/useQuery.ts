@@ -1,4 +1,5 @@
 /* eslint-disable react-hooks/exhaustive-deps */
+/* eslint-disable no-console */
 
 import type { Source } from 'wonka';
 import { pipe, subscribe, onEnd, onPush, takeWhile } from 'wonka';
@@ -74,13 +75,23 @@ export type UseQueryArgs<
    * @remarks
    * `pause` may be set to `true` to stop {@link useQuery} from executing
    * automatically. The hook will stop receiving updates from the {@link Client}
-   * and won’t execute the query operation, until either it’s set to `false`
+   * and won't execute the query operation, until either it's set to `false`
    * or the {@link UseQueryExecute} function is called.
    *
    * @see {@link https://urql.dev/goto/docs/basics/react-preact/#pausing-usequery} for
    * documentation on the `pause` option.
    */
   pause?: boolean;
+  /** Enables verbose console logging for debugging suspense issues.
+   *
+   * @remarks
+   * When set to `true`, `useQuery` will output detailed console logs
+   * about its internal state transitions, cache operations, and suspense behavior.
+   * This is useful for debugging issues related to suspense and cache interactions.
+   *
+   * @defaultValue false
+   */
+  debug?: boolean;
 } & GraphQLRequestParams<Data, Variables>;
 
 /** State of the current query, your {@link useQuery} hook is executing.
@@ -225,19 +236,53 @@ export function useQuery<
   const cache = getCacheForClient(client);
   const suspense = isSuspense(client, args.context);
   const request = useRequest(args.query, args.variables as Variables);
+  const debug = args.debug !== undefined ? args.debug : false;
+
+  if (debug) {
+    console.log('[useQuery] render', {
+      requestKey: request.key,
+      suspense,
+      pause: args.pause,
+      requestPolicy: args.requestPolicy,
+    });
+  }
 
   const source = React.useMemo(() => {
-    if (args.pause) return null;
+    if (debug) {
+      console.log('[useQuery] useMemo source', {
+        pause: args.pause,
+        suspense,
+        requestKey: request.key,
+      });
+    }
+
+    if (args.pause) {
+      if (debug) console.log('[useQuery] paused, returning null source');
+      return null;
+    }
 
     const source = client.executeQuery(request, {
       requestPolicy: args.requestPolicy,
       ...args.context,
     });
 
+    if (debug) {
+      console.log('[useQuery] created source', { suspense });
+    }
+
     return suspense
       ? pipe(
           source,
           onPush(result => {
+            if (debug) {
+              console.log('[useQuery] onPush (suspense cache set)', {
+                requestKey: request.key,
+                hasData: 'data' in result && result.data !== undefined,
+                hasError: 'error' in result && result.error !== undefined,
+                stale: result.stale,
+                hasNext: result.hasNext,
+              });
+            }
             cache.set(request.key, result);
           })
         )
@@ -250,6 +295,7 @@ export function useQuery<
     args.pause,
     args.requestPolicy,
     args.context,
+    debug,
   ]);
 
   const getSnapshot = React.useCallback(
@@ -257,27 +303,95 @@ export function useQuery<
       source: Source<OperationResult<Data, Variables>> | null,
       suspense: boolean
     ): Partial<UseQueryState<Data, Variables>> => {
-      if (!source) return { fetching: false };
+      if (debug) {
+        console.log('[useQuery] getSnapshot called', {
+          hasSource: !!source,
+          suspense,
+          requestKey: request.key,
+        });
+      }
+
+      if (!source) {
+        if (debug)
+          console.log(
+            '[useQuery] getSnapshot: no source, returning fetching: false'
+          );
+        return { fetching: false };
+      }
 
       let result = cache.get(request.key);
+      if (debug) {
+        console.log('[useQuery] getSnapshot: cache lookup', {
+          requestKey: request.key,
+          cacheHit: !!result,
+          isPromise: result != null && 'then' in result,
+          hasData:
+            result &&
+            !('then' in result) &&
+            'data' in result &&
+            result.data !== undefined,
+          hasError:
+            result &&
+            !('then' in result) &&
+            'error' in result &&
+            result.error !== undefined,
+        });
+      }
+
       if (!result) {
         let resolve: (value: unknown) => void;
 
+        if (debug)
+          console.log(
+            '[useQuery] getSnapshot: no cached result, subscribing to source'
+          );
+
         const subscription = pipe(
           source,
-          takeWhile(
-            () =>
+          takeWhile(() => {
+            const shouldContinue =
               (suspense && !resolve) ||
               !result ||
-              ('hasNext' in result && result.hasNext)
-          ),
+              ('hasNext' in result && result.hasNext);
+            if (debug) {
+              console.log('[useQuery] getSnapshot takeWhile check', {
+                suspense,
+                hasResolve: !!resolve,
+                hasResult: !!result,
+                hasNext: result && 'hasNext' in result ? result.hasNext : 'N/A',
+                shouldContinue,
+              });
+            }
+            return shouldContinue;
+          }),
           subscribe(_result => {
+            if (debug) {
+              console.log(
+                '[useQuery] getSnapshot subscription received result',
+                {
+                  hasData: 'data' in _result && _result.data !== undefined,
+                  hasError: 'error' in _result && _result.error !== undefined,
+                  stale: _result.stale,
+                  hasNext: _result.hasNext,
+                }
+              );
+            }
             result = _result;
-            if (resolve) resolve(result);
+            if (resolve) {
+              if (debug)
+                console.log(
+                  '[useQuery] getSnapshot: resolving suspense promise'
+                );
+              resolve(result);
+            }
           })
         );
 
         if (result == null && suspense) {
+          if (debug)
+            console.log(
+              '[useQuery] getSnapshot: creating suspense promise and throwing'
+            );
           const promise = new Promise(_resolve => {
             resolve = _resolve;
           });
@@ -285,15 +399,33 @@ export function useQuery<
           cache.set(request.key, promise);
           throw promise;
         } else {
+          if (debug)
+            console.log(
+              '[useQuery] getSnapshot: unsubscribing (not suspense or has result)'
+            );
           subscription.unsubscribe();
         }
       } else if (suspense && result != null && 'then' in result) {
+        if (debug)
+          console.log(
+            '[useQuery] getSnapshot: re-throwing existing suspense promise'
+          );
         throw result;
       }
 
-      return (result as OperationResult<Data, Variables>) || { fetching: true };
+      const finalResult = (result as OperationResult<Data, Variables>) || {
+        fetching: true,
+      };
+      if (debug) {
+        console.log('[useQuery] getSnapshot: returning result', {
+          hasData: 'data' in finalResult && finalResult.data !== undefined,
+          hasError: 'error' in finalResult && finalResult.error !== undefined,
+          fetching: 'fetching' in finalResult ? finalResult.fetching : 'N/A',
+        });
+      }
+      return finalResult;
     },
-    [cache, request]
+    [cache, request, debug]
   );
 
   const deps = [
@@ -304,20 +436,26 @@ export function useQuery<
     args.pause,
   ] as const;
 
-  const [state, setState] = React.useState(
-    () =>
-      [
-        source,
-        computeNextState(
-          initialState,
-          deferDispatch(() => getSnapshot(source, suspense))
-        ),
-        deps,
-      ] as const
-  );
+  const [state, setState] = React.useState(() => {
+    if (debug) console.log('[useQuery] useState initializer');
+    return [
+      source,
+      computeNextState(
+        initialState,
+        deferDispatch(() => getSnapshot(source, suspense))
+      ),
+      deps,
+    ] as const;
+  });
 
   let currentResult = state[1];
   if (source !== state[0] && hasDepsChanged(state[2], deps)) {
+    if (debug) {
+      console.log('[useQuery] deps changed, updating state', {
+        sourceChanged: source !== state[0],
+        depsChanged: hasDepsChanged(state[2], deps),
+      });
+    }
     setState([
       source,
       (currentResult = computeNextState(
@@ -332,12 +470,32 @@ export function useQuery<
     const source = state[0];
     const request = state[2][1];
 
+    if (debug) {
+      console.log('[useQuery] useEffect setup', {
+        hasSource: !!source,
+        requestKey: request.key,
+      });
+    }
+
     let hasResult = false;
 
     const updateResult = (result: Partial<UseQueryState<Data, Variables>>) => {
+      if (debug) {
+        console.log('[useQuery] useEffect updateResult', {
+          hasData: 'data' in result && result.data !== undefined,
+          hasError: 'error' in result && result.error !== undefined,
+          fetching: 'fetching' in result ? result.fetching : 'N/A',
+          stale: 'stale' in result ? result.stale : 'N/A',
+        });
+      }
       hasResult = true;
       deferDispatch(setState, state => {
         const nextResult = computeNextState(state[1], result);
+        if (debug) {
+          console.log('[useQuery] useEffect setState', {
+            stateChanged: state[1] !== nextResult,
+          });
+        }
         return state[1] !== nextResult
           ? [state[0], nextResult, state[2]]
           : state;
@@ -348,24 +506,54 @@ export function useQuery<
       const subscription = pipe(
         source,
         onEnd(() => {
+          if (debug) console.log('[useQuery] useEffect source onEnd');
           updateResult({ fetching: false });
         }),
-        subscribe(updateResult)
+        subscribe(result => {
+          if (debug) {
+            console.log('[useQuery] useEffect subscription received', {
+              hasData: 'data' in result && result.data !== undefined,
+              hasError: 'error' in result && result.error !== undefined,
+              stale: result.stale,
+              hasNext: result.hasNext,
+            });
+          }
+          updateResult(result);
+        })
       );
 
-      if (!hasResult) updateResult({ fetching: true });
+      if (!hasResult) {
+        if (debug)
+          console.log(
+            '[useQuery] useEffect: no result yet, setting fetching: true'
+          );
+        updateResult({ fetching: true });
+      }
 
       return () => {
+        if (debug)
+          console.log('[useQuery] useEffect cleanup', {
+            requestKey: request.key,
+          });
         cache.dispose(request.key);
         subscription.unsubscribe();
       };
     } else {
+      if (debug)
+        console.log('[useQuery] useEffect: no source, setting fetching: false');
       updateResult({ fetching: false });
     }
-  }, [cache, state[0], state[2][1]]);
+  }, [cache, state[0], state[2][1], debug]);
 
   const executeQuery = React.useCallback(
     (opts?: Partial<OperationContext>) => {
+      if (debug) {
+        console.log('[useQuery] executeQuery called', {
+          requestKey: request.key,
+          opts,
+        });
+      }
+
       const context = {
         requestPolicy: args.requestPolicy,
         ...args.context,
@@ -373,10 +561,21 @@ export function useQuery<
       };
 
       deferDispatch(setState, state => {
+        if (debug) console.log('[useQuery] executeQuery: creating new source');
         const source = suspense
           ? pipe(
               client.executeQuery(request, context),
               onPush(result => {
+                if (debug) {
+                  console.log(
+                    '[useQuery] executeQuery onPush (suspense cache set)',
+                    {
+                      requestKey: request.key,
+                      hasData: 'data' in result && result.data !== undefined,
+                      hasError: 'error' in result && result.error !== undefined,
+                    }
+                  );
+                }
                 cache.set(request.key, result);
               })
             )
@@ -392,8 +591,18 @@ export function useQuery<
       args.requestPolicy,
       args.context,
       args.pause,
+      debug,
     ]
   );
+
+  if (debug) {
+    console.log('[useQuery] returning result', {
+      fetching: currentResult.fetching,
+      hasData: currentResult.data !== undefined,
+      hasError: currentResult.error !== undefined,
+      stale: currentResult.stale,
+    });
+  }
 
   return [currentResult, executeQuery];
 }
