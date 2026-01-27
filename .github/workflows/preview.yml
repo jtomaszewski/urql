@@ -45,4 +45,4 @@ jobs:
         run: pnpm build
 
       - name: Publish Preview
-        run: pnpm dlx pkg-pr-new publish --compact --pnpm './packages/*' './exchanges/*'
+        run: pnpm dlx pkg-pr-new publish --pnpm './packages/*' './exchanges/*'
