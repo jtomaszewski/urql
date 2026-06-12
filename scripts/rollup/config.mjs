@@ -91,7 +91,10 @@ const output = ({ format, isProduction }) => {
     dir: './dist',
     exports: 'named',
     sourcemap: true,
-    banner: chunk => (chunk.name === 'urql-next' ? '"use client"' : undefined),
+    banner: chunk =>
+      chunk.name === 'urql-next' || chunk.name === 'urql-expo-router'
+        ? '"use client"'
+        : undefined,
     sourcemapExcludeSources: isCI,
     hoistTransitiveImports: false,
     indent: false,
